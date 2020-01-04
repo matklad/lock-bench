@@ -3,27 +3,58 @@ use std::{iter, sync::Barrier, time};
 use crossbeam_utils::{thread::scope, CachePadded};
 
 fn main() {
+    let mut args = std::env::args()
+        .skip(1)
+        .map(|it| it.parse::<u32>().unwrap());
+
     let options = Options {
-        n_threads: 32,
-        n_locks: 1000,
-        n_rounds: 10_000,
+        n_threads: args.next().unwrap(),
+        n_locks: args.next().unwrap(),
+        n_ops: args.next().unwrap(),
+        n_rounds: args.next().unwrap(),
     };
     println!("{:#?}\n", options);
 
     bench::<mutexes::Std>(&options);
     bench::<mutexes::ParkingLot>(&options);
     bench::<mutexes::Spin>(&options);
+    bench::<mutexes::AmdSpin>(&options);
+
+    println!();
+    bench::<mutexes::Std>(&options);
+    bench::<mutexes::ParkingLot>(&options);
+    bench::<mutexes::Spin>(&options);
+    bench::<mutexes::AmdSpin>(&options);
 }
 
 fn bench<M: Mutex>(options: &Options) {
-    let time = run_bench::<M>(options);
-    println!("{:<20} {:?}", M::LABEL, time)
+    let mut times = (0..options.n_rounds)
+        .map(|_| run_bench::<M>(options))
+        .collect::<Vec<_>>();
+    times.sort();
+
+    let avg = times.iter().sum::<time::Duration>() / options.n_rounds;
+    let min = times[0];
+    let max = *times.last().unwrap();
+
+    let avg = format!("{:?}", avg);
+    let min = format!("{:?}", min);
+    let max = format!("{:?}", max);
+
+    println!(
+        "{:<20} avg {:<12} min {:<12} max {:<12}",
+        M::LABEL,
+        avg,
+        min,
+        max
+    )
 }
 
 #[derive(Debug)]
 struct Options {
     n_threads: u32,
     n_locks: u32,
+    n_ops: u32,
     n_rounds: u32,
 }
 
@@ -61,7 +92,7 @@ fn run_bench<M: Mutex>(options: &Options) -> time::Duration {
                 let indexes = random_numbers(thread_seed)
                     .map(|it| it % options.n_locks)
                     .map(|it| it as usize)
-                    .take(options.n_rounds as usize);
+                    .take(options.n_ops as usize);
                 for idx in indexes {
                     locks[idx].with_lock(|cnt| *cnt += 1);
                 }
@@ -79,7 +110,7 @@ fn run_bench<M: Mutex>(options: &Options) -> time::Duration {
         for lock in locks.iter() {
             lock.with_lock(|cnt| total += *cnt);
         }
-        assert_eq!(total, options.n_threads * options.n_rounds);
+        assert_eq!(total, options.n_threads * options.n_ops);
 
         elapsed
     })
@@ -114,6 +145,79 @@ mod mutexes {
         fn with_lock(&self, f: impl FnOnce(&mut u32)) {
             let mut guard = self.lock();
             f(&mut guard)
+        }
+    }
+
+    pub(crate) type AmdSpin = crate::amd_spinlock::AmdSpinlock<u32>;
+    impl Mutex for AmdSpin {
+        const LABEL: &'static str = "AmdSpinlock";
+        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
+            let mut guard = self.lock();
+            f(&mut guard)
+        }
+    }
+}
+
+mod amd_spinlock {
+    use std::{
+        cell::UnsafeCell,
+        ops,
+        sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
+    };
+
+    #[derive(Default)]
+    pub(crate) struct AmdSpinlock<T> {
+        locked: AtomicBool,
+        data: UnsafeCell<T>,
+    }
+    unsafe impl<T: Send> Send for AmdSpinlock<T> {}
+    unsafe impl<T: Send> Sync for AmdSpinlock<T> {}
+
+    pub(crate) struct AmdSpinlockGuard<'a, T> {
+        lock: &'a AmdSpinlock<T>,
+    }
+
+    impl<T> AmdSpinlock<T> {
+        pub(crate) fn lock(&self) -> AmdSpinlockGuard<T> {
+            loop {
+                let was_locked = self.locked.load(Ordering::Relaxed);
+                if !was_locked
+                    && self
+                        .locked
+                        .compare_exchange_weak(
+                            was_locked,
+                            true,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    break;
+                }
+                spin_loop_hint()
+            }
+            AmdSpinlockGuard { lock: self }
+        }
+    }
+
+    impl<'a, T> ops::Deref for AmdSpinlockGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &Self::Target {
+            let ptr = self.lock.data.get();
+            unsafe { &*ptr }
+        }
+    }
+
+    impl<'a, T> ops::DerefMut for AmdSpinlockGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            let ptr = self.lock.data.get();
+            unsafe { &mut *ptr }
+        }
+    }
+
+    impl<'a, T> Drop for AmdSpinlockGuard<'a, T> {
+        fn drop(&mut self) {
+            self.lock.locked.store(false, Ordering::Release)
         }
     }
 }
